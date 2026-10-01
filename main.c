@@ -4,6 +4,7 @@
 #include <util/delay.h>
 #include <stdint.h>
 #include <string.h>
+#include <avr/interrupt.h>
 
 /* =========================================================
  * UART
@@ -31,7 +32,32 @@ static int uart_putc(char c, void *unused)
 
 
 /* =========================================================
- * TCB + task stacks
+ * TIMER1
+ *
+ * 16 MHz / 64 = 250 kHz
+ *
+ * OCR1A = 249
+ *
+ * 250 kHz / (249 + 1) = 1000 Hz
+ *
+ * Therefore:
+ *      Timer interrupt every 1 ms
+ * ========================================================= */
+
+static void timer1_init(void)
+{
+    TCCR1A = 0;
+
+    TCCR1B = _BV(WGM12) | _BV(CS11) | _BV(CS10);
+
+    OCR1A = 249;
+
+    TIMSK1 = _BV(OCIE1A);
+}
+
+
+/* =========================================================
+ * TCB + TASK STACKS
  * ========================================================= */
 
 #define STACK_SIZE 160
@@ -54,24 +80,25 @@ volatile tcb_t *current;
 /* =========================================================
  * SAVE_CONTEXT
  *
- * Stack frame produced:
+ * The CALL/interrupt has already pushed the return PC.
  *
- *   r0
- *   SREG
- *   r1
- *   r2
- *   ...
- *   r31
+ * Additional frame:
  *
- * The CALL to os_yield() has already pushed the return PC.
+ *      r0
+ *      SREG
+ *      r1
+ *      r2
+ *      ...
+ *      r31
  *
- * Total:
- *   2 bytes PC
- *   1 byte r0
- *   1 byte SREG
- *   31 bytes r1-r31
+ * Total context:
  *
- * = 35 bytes
+ *      2 bytes PC
+ *      1 byte  r0
+ *      1 byte  SREG
+ *      31 bytes r1-r31
+ *
+ *      = 35 bytes
  * ========================================================= */
 
 #define SAVE_CONTEXT()                                      \
@@ -128,19 +155,23 @@ volatile tcb_t *current;
 /* =========================================================
  * RESTORE_CONTEXT
  *
- * Reverse of SAVE_CONTEXT.
+ * Load current task's SP.
  *
- * It loads the new task's SP, then:
+ * Then restore:
  *
- *   pop r31
- *   ...
- *   pop r1
- *   pop saved SREG
- *   restore SREG
- *   pop original r0
+ *      r31
+ *      r30
+ *      ...
+ *      r1
+ *      SREG
+ *      r0
  *
- * It does NOT execute RET.
- * os_yield()/start_first() do RET afterward.
+ * It does NOT execute RET or RETI.
+ *
+ * The caller decides:
+ *
+ *      start_first() -> RET
+ *      Timer ISR     -> RETI
  * ========================================================= */
 
 #define RESTORE_CONTEXT()                                   \
@@ -148,13 +179,13 @@ volatile tcb_t *current;
         /* X = current */                                    \
         "lds  r26, current     \n\t"                        \
         "lds  r27, current+1   \n\t"                        \
-                                                             \
+                                                            \
         /* Load current->sp */                               \
         "ld   r28, X+          \n\t"                        \
         "out  __SP_L__, r28    \n\t"                        \
         "ld   r29, X+          \n\t"                        \
         "out  __SP_H__, r29    \n\t"                        \
-                                                             \
+                                                            \
         "pop  r31              \n\t"                        \
         "pop  r30              \n\t"                        \
         "pop  r29              \n\t"                        \
@@ -186,85 +217,18 @@ volatile tcb_t *current;
         "pop  r3               \n\t"                        \
         "pop  r2               \n\t"                        \
         "pop  r1               \n\t"                        \
-                                                             \
-        /* This pop gets SAVED SREG */                       \
+                                                            \
+        /* Restore saved SREG */                             \
         "pop  r0               \n\t"                        \
         "out  __SREG__, r0     \n\t"                        \
-                                                             \
-        /* This pop gets ORIGINAL r0 */                      \
+                                                            \
+        /* Restore original r0 */                           \
         "pop  r0               \n\t"                        \
     )
 
 
 /* =========================================================
- * Create fake initial stack frame
- * ========================================================= */
-
-static void create_task(tcb_t *t, void (*fn)(void))
-{
-    memset(t->stack, 0xAA, STACK_SIZE);
-
-    /*
-     * Start at the top of the stack.
-     *
-     * PUSH writes then decrements SP,
-     * so POP will later increment before reading.
-     */
-    uint8_t *sp = &t->stack[STACK_SIZE - 1];
-
-    /*
-     * Fake return address.
-     *
-     * On the ATmega328P this matches the 16-bit AVR task
-     * context used by the frame we're building.
-     */
-    uint16_t pc = (uint16_t)(uintptr_t)fn;
-
-    /*
-     * Build frame:
-     *
-     * PC low
-     * PC high
-     * r0
-     * SREG
-     * r1
-     * r2
-     * ...
-     * r31
-     */
-
-    *sp-- = (uint8_t)(pc & 0xFF);   // PC low
-    *sp-- = (uint8_t)(pc >> 8);     // PC high
-
-    *sp-- = 0x00;                   // r0
-
-    /*
-     * SREG:
-     * bit 7 = I = 1
-     */
-    *sp-- = 0x80;
-
-    *sp-- = 0x00;                   // r1
-
-    for (uint8_t r = 2; r <= 31; r++)
-        *sp-- = 0x00;
-
-    /*
-     * SP must point immediately below r31.
-     *
-     * RESTORE_CONTEXT starts with:
-     *
-     *     pop r31
-     */
-    t->sp = sp;
-}
-
-
-/* =========================================================
- * Switch current task
- *
- * This is ordinary C because os_yield() is naked and the
- * context has already been saved before this function runs.
+ * SWITCH CURRENT TASK
  * ========================================================= */
 
 __attribute__((noinline, used))
@@ -278,63 +242,129 @@ void switch_current_task(void)
 
 
 /* =========================================================
- * Cooperative yield
+ * TIMER1 PREEMPTION ISR
+ *
+ * This is the heart of Stage B.
+ *
+ * Timer interrupt
+ *      ↓
+ * SAVE_CONTEXT()
+ *      ↓
+ * Save current task's SP
+ *      ↓
+ * switch_current_task()
+ *      ↓
+ * current now points to other task
+ *      ↓
+ * RESTORE_CONTEXT()
+ *      ↓
+ * RETI
+ *      ↓
+ * other task continues
  * ========================================================= */
 
-__attribute__((naked, noinline))
-void os_yield(void)
+ISR(TIMER1_COMPA_vect, ISR_NAKED)
 {
-    /*
-     * IMPORTANT:
-     *
-     * SAVE_CONTEXT itself saves SREG first and then executes
-     * CLI. Do not put another CLI before it, otherwise the
-     * saved SREG would contain I=0.
-     */
-
     SAVE_CONTEXT();
 
-    /*
-     * Switch current from task 0 <-> task 1.
-     *
-     * The current task's SP was already saved into its TCB.
-     */
     asm volatile (
         "call switch_current_task \n\t"
         ::: "memory"
     );
 
-    /*
-     * Load the other task's SP and restore its frame.
-     */
     RESTORE_CONTEXT();
 
-    /*
-     * RET uses the restored task's fake/real return PC.
-     */
     asm volatile (
-        "ret \n\t"
+        "reti \n\t"
     );
 }
 
 
 /* =========================================================
- * Start first task
+ * CREATE INITIAL TASK STACK
+ * ========================================================= */
+
+static void create_task(tcb_t *t, void (*fn)(void))
+{
+    memset(t->stack, 0xAA, STACK_SIZE);
+
+    /*
+     * Start at the top of the stack.
+     *
+     * PUSH writes and then decrements SP.
+     * Therefore POP later increments before reading.
+     */
+    uint8_t *sp = &t->stack[STACK_SIZE - 1];
+
+
+    /*
+     * Fake return address.
+     *
+     * When RET is eventually executed, the CPU will jump
+     * to this address, which is the task function.
+     */
+    uint16_t pc = (uint16_t)(uintptr_t)fn;
+
+
+    /*
+     * Build the fake context frame:
+     *
+     *      PC low
+     *      PC high
+     *      r0
+     *      SREG
+     *      r1
+     *      r2
+     *      ...
+     *      r31
+     */
+
+    *sp-- = (uint8_t)(pc & 0xFF);   // PC low
+    *sp-- = (uint8_t)(pc >> 8);     // PC high
+
+    *sp-- = 0x00;                   // r0
+
+    /*
+     * SREG:
+     *
+     * bit 7 = I = 1
+     *
+     * Therefore interrupts will be enabled when
+     * this task's context is restored.
+     */
+    *sp-- = 0x80;
+
+    *sp-- = 0x00;                   // r1
+
+    for (uint8_t r = 2; r <= 31; r++)
+        *sp-- = 0x00;
+
+
+    /*
+     * SP now points immediately below r31.
+     *
+     * RESTORE_CONTEXT() starts with:
+     *
+     *      pop r31
+     */
+    t->sp = sp;
+}
+
+
+/* =========================================================
+ * START FIRST TASK
+ *
+ * There is no previous task to restore.
+ *
+ * We restore the fake context created by create_task()
+ * and then RET into task_a().
  * ========================================================= */
 
 __attribute__((naked, noreturn))
 void start_first(void)
 {
-    /*
-     * current already points at tasks[0].
-     *
-     * Its fake frame is already prepared.
-     */
     RESTORE_CONTEXT();
 
-    /*
-     * The fake PC at the top of the frame is task_a().
-     */
     asm volatile (
         "ret \n\t"
     );
@@ -345,17 +375,7 @@ void start_first(void)
  * TASK A
  * ========================================================= */
 
-static void task_a(void)
-{
-    for (;;) {
-
-        uart_putc('A', NULL);
-
-        _delay_ms(200);
-
-        os_yield();
-    }
-}
+static void task_a(void) { for (;;) { uart_putc('A', NULL); } }
 
 
 /* =========================================================
@@ -365,12 +385,8 @@ static void task_a(void)
 static void task_b(void)
 {
     for (;;) {
-
         uart_putc('B', NULL);
-
         _delay_ms(200);
-
-        os_yield();
     }
 }
 
@@ -383,9 +399,6 @@ int main(void)
 {
     uart_init();
 
-    /*
-     * Create the fake initial stack frames.
-     */
     create_task(&tasks[0], task_a);
     create_task(&tasks[1], task_b);
 
@@ -395,8 +408,17 @@ int main(void)
     current = &tasks[0];
 
     /*
-     * Never returns to main().
-     * RESTORE_CONTEXT + RET jumps to task_a().
+     * Enable Timer1 preemption.
+     */
+    timer1_init();
+
+    /*
+     * Enable global interrupts.
+     */
+    sei();
+
+    /*
+     * Restore task A's fake context and jump to task_a().
      */
     start_first();
 
