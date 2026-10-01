@@ -1,6 +1,7 @@
 #include <avr/io.h>
 #include <stdio.h>
 #include <avr/interrupt.h>
+#include <string.h>
 
 static volatile uint16_t ticks;
 
@@ -53,6 +54,34 @@ static int uart_putc(char c, FILE *f)
 static FILE uart_out =
     FDEV_SETUP_STREAM(uart_putc, NULL, _FDEV_SETUP_WRITE);
 
+
+#define STACK_SIZE 160
+
+typedef struct {
+    volatile uint8_t *sp;          /* MUST be first member */
+    uint8_t stack[STACK_SIZE];
+} tcb_t;
+
+static tcb_t task0;
+
+static void dummy_task(void) { for (;;) { } }
+
+static void create_task(tcb_t *t, void (*fn)(void))
+{
+    memset(t->stack, 0xAA, STACK_SIZE);            /* paint, for stack usage later */
+    uint8_t *sp = &t->stack[STACK_SIZE - 1];
+    uint16_t pc = (uint16_t)fn;                    /* word address on AVR */
+
+    *sp-- = (uint8_t)(pc & 0xFF);                  /* PC low  */
+    *sp-- = (uint8_t)(pc >> 8);                    /* PC high */
+    *sp-- = 0x00;                                  /* r0 */
+    *sp-- = 0x80;                                  /* SREG, I flag set */
+    *sp-- = 0x00;                                  /* r1 */
+    for (uint8_t r = 2; r <= 31; r++) *sp-- = 0;   /* r2..r31 */
+
+    t->sp = sp;
+}
+
 int main(void)
 {
     uint16_t last = 0;
@@ -64,6 +93,13 @@ int main(void)
     timer1_init();
 
     stdout = &uart_out;
+
+    create_task(&task0, dummy_task);
+
+    printf("sp offset = %u\n", (unsigned)(task0.sp - task0.stack));
+    for (uint8_t i = 0; i < 40; i++)
+        printf("%02x ", task0.stack[STACK_SIZE - 1 - i]);
+    printf("\n");
 
     /* Globally enable interrupts */
     sei();
