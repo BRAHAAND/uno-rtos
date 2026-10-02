@@ -1,11 +1,18 @@
 #define F_CPU 16000000UL
 
 #include <avr/io.h>
-#include <util/delay.h>
 #include <stdint.h>
 #include <string.h>
 #include <stddef.h>
 #include <avr/interrupt.h>
+
+
+/* =========================================================
+ * Forward declarations
+ * ========================================================= */
+
+typedef struct tcb tcb_t;
+typedef struct os_mutex os_mutex_t;
 
 
 /* =========================================================
@@ -20,6 +27,7 @@ static void uart_init(void)
     UCSR0C = _BV(UCSZ01) | _BV(UCSZ00); // 8N1
 }
 
+
 static int uart_putc(char c, void *unused)
 {
     (void)unused;
@@ -30,6 +38,30 @@ static int uart_putc(char c, void *unused)
     UDR0 = c;
 
     return 0;
+}
+
+
+static void uart_puts(const char *s)
+{
+    while (*s)
+        uart_putc(*s++, NULL);
+}
+
+
+static void uart_print_u8(uint8_t v)
+{
+    char buf[3];
+    uint8_t n = 0;
+
+    do
+    {
+        buf[n++] = '0' + v % 10;
+        v /= 10;
+    }
+    while (v);
+
+    while (n)
+        uart_putc(buf[--n], NULL);
 }
 
 
@@ -75,6 +107,16 @@ typedef struct
 
 
 /* =========================================================
+ * Priority-inheritance mutex
+ * ========================================================= */
+
+struct os_mutex
+{
+    volatile tcb_t *owner;
+};
+
+
+/* =========================================================
  * Queue
  * ========================================================= */
 
@@ -83,8 +125,11 @@ typedef struct
 typedef struct
 {
     uint8_t buf[QUEUE_LEN];
-    volatile uint8_t head, tail;
-    os_sem_t items, spaces;
+    volatile uint8_t head;
+    volatile uint8_t tail;
+
+    os_sem_t items;
+    os_sem_t spaces;
 } os_queue_t;
 
 
@@ -95,9 +140,6 @@ typedef struct
 static os_sem_t   uart_lock;
 static os_queue_t q;
 
-/* Temporary lock for Step 11 priority-inversion test */
-static os_sem_t test_lock;
-
 
 /* =========================================================
  * Task control block
@@ -106,15 +148,35 @@ static os_sem_t test_lock;
 #define STACK_SIZE 160
 #define MAX_TASKS  5
 
-typedef struct
+struct tcb
 {
     volatile uint8_t *sp;      /* MUST stay first */
+
     uint8_t state;
+
+    /*
+     * prio:
+     *     Current/effective priority.
+     *
+     * base_prio:
+     *     Original priority assigned when task
+     *     was created.
+     */
     uint8_t prio;
+    uint8_t base_prio;
+
     uint16_t wake;
+
     os_sem_t *wait_on;
+
+    /*
+     * Non-NULL when this task is waiting for
+     * a priority-inheritance mutex.
+     */
+    os_mutex_t *wait_mutex;
+
     uint8_t stack[STACK_SIZE];
-} tcb_t;
+};
 
 
 tcb_t tasks[MAX_TASKS];
@@ -254,8 +316,7 @@ void os_schedule(void)
 
 
     /*
-     * Wake delayed tasks and tasks waiting on
-     * an available semaphore.
+     * Wake delayed tasks.
      */
     for (uint8_t i = 0; i < ntasks; i++)
     {
@@ -264,8 +325,34 @@ void os_schedule(void)
         {
             tasks[i].state = T_READY;
         }
-        else if (tasks[i].state == T_WAITING &&
-                 tasks[i].wait_on->count > 0)
+    }
+
+
+    /*
+     * Wake tasks waiting for semaphores.
+     */
+    for (uint8_t i = 0; i < ntasks; i++)
+    {
+        if (tasks[i].state == T_WAITING &&
+            tasks[i].wait_on != NULL &&
+            tasks[i].wait_mutex == NULL &&
+            tasks[i].wait_on->count > 0)
+        {
+            tasks[i].state = T_READY;
+            tasks[i].wait_on = NULL;
+        }
+    }
+
+
+    /*
+     * Wake tasks waiting for a mutex when
+     * the mutex has become free.
+     */
+    for (uint8_t i = 0; i < ntasks; i++)
+    {
+        if (tasks[i].state == T_WAITING &&
+            tasks[i].wait_mutex != NULL &&
+            tasks[i].wait_mutex->owner == NULL)
         {
             tasks[i].state = T_READY;
         }
@@ -273,7 +360,8 @@ void os_schedule(void)
 
 
     /*
-     * Find highest priority among READY tasks.
+     * Find highest effective priority among
+     * READY tasks.
      */
     uint8_t highest_prio = 0;
 
@@ -372,16 +460,10 @@ void os_sem_wait(os_sem_t *s)
         }
 
         ((tcb_t *)current)->state = T_WAITING;
-
         ((tcb_t *)current)->wait_on = s;
+        ((tcb_t *)current)->wait_mutex = NULL;
 
         os_yield();
-
-        /*
-         * os_yield() comes back with interrupts enabled.
-         * If another task did not give us the semaphore,
-         * retry.
-         */
     }
 }
 
@@ -393,6 +475,138 @@ void os_sem_post(os_sem_t *s)
     s->count++;
 
     sei();
+}
+
+
+/* =========================================================
+ * Priority-inheritance mutex
+ * ========================================================= */
+
+void os_mutex_init(os_mutex_t *m)
+{
+    m->owner = NULL;
+}
+
+
+/*
+ * Lock the mutex.
+ *
+ * If the mutex is free:
+ *
+ *     current becomes owner.
+ *
+ * If another task owns it:
+ *
+ *     current blocks.
+ *
+ *     If current has higher priority than the owner,
+ *     temporarily raise the owner's effective priority.
+ */
+void os_mutex_lock(os_mutex_t *m)
+{
+    for (;;)
+    {
+        cli();
+
+        /*
+         * Mutex is free.
+         */
+        if (m->owner == NULL)
+        {
+            m->owner = (tcb_t *)current;
+
+            ((tcb_t *)current)->wait_mutex = NULL;
+
+            sei();
+
+            return;
+        }
+
+
+        /*
+         * Mutex is already owned.
+         */
+        if (m->owner != current)
+        {
+            tcb_t *owner = (tcb_t *)m->owner;
+            tcb_t *me = (tcb_t *)current;
+
+
+            /*
+             * Priority inheritance:
+             *
+             * If the waiting task has a higher priority
+             * than the owner, boost the owner.
+             */
+            if (me->prio > owner->prio)
+            {
+                owner->prio = me->prio;
+            }
+
+
+            /*
+             * Block the current task.
+             */
+            me->wait_mutex = m;
+            me->state = T_WAITING;
+
+            os_yield();
+
+            /*
+             * When this task is scheduled again,
+             * retry the lock acquisition.
+             */
+        }
+        else
+        {
+            /*
+             * Recursive locking is not supported.
+             */
+            sei();
+            return;
+        }
+    }
+}
+
+
+/*
+ * Unlock the mutex.
+ *
+ * The owner releases the mutex and returns to its
+ * original priority.
+ */
+void os_mutex_unlock(os_mutex_t *m)
+{
+    cli();
+
+    tcb_t *me = (tcb_t *)current;
+
+    if (m->owner != me)
+    {
+        sei();
+        return;
+    }
+
+
+    /*
+     * Release the mutex.
+     */
+    m->owner = NULL;
+
+
+    /*
+     * Remove priority inheritance.
+     */
+    me->prio = me->base_prio;
+
+
+    /*
+     * Immediately reschedule.
+     *
+     * A higher-priority waiting task may now
+     * acquire the mutex.
+     */
+    os_yield();
 }
 
 
@@ -480,7 +694,7 @@ static int8_t create_task(void (*fn)(void), uint8_t prio)
 
 
     /*
-     * Build the fake stack frame.
+     * Build fake stack frame.
      */
 
     uint8_t *sp = &t->stack[STACK_SIZE - 1];
@@ -508,13 +722,19 @@ static int8_t create_task(void (*fn)(void), uint8_t prio)
 
     t->sp = sp;
 
+    /*
+     * Save both priorities.
+     */
     t->prio = prio;
+    t->base_prio = prio;
 
     t->state = T_READY;
 
     t->wake = 0;
 
     t->wait_on = NULL;
+
+    t->wait_mutex = NULL;
 
     return ntasks++;
 }
@@ -551,72 +771,67 @@ void start_first(void)
 
 
 /* =========================================================
- * Printing helpers
+ * Priority-inheritance demonstration
  * ========================================================= */
 
-static void uart_puts(const char *s)
-{
-    while (*s)
-        uart_putc(*s++, NULL);
-}
+static os_mutex_t test_mutex;
 
 
-/* =========================================================
- * Priority inversion test tasks
- * ========================================================= */
+/* ---------------------------------------------------------
+ * LOW priority task
+ * --------------------------------------------------------- */
 
 static void low_task(void)
 {
     uart_puts("LOW: starting\r\n");
 
     /*
-     * Give LOW time to start before HIGH is allowed
-     * to request the lock.
+     * Give LOW time to start before HIGH tries
+     * to acquire the mutex.
      */
     os_delay(20);
 
-    uart_puts("LOW: trying to acquire lock\r\n");
+    uart_puts("LOW: trying to acquire mutex\r\n");
 
-    os_sem_wait(&test_lock);
+    os_mutex_lock(&test_mutex);
 
-    uart_puts("LOW: acquired lock\r\n");
+    uart_puts("LOW: acquired mutex\r\n");
 
     /*
-     * Hold the lock while doing work.
+     * Hold the mutex while doing work.
      *
-     * HIGH will eventually try to acquire the same
-     * lock and block.
+     * HIGH will try to acquire it.
      */
     for (volatile uint32_t i = 0; i < 500000UL; i++)
     {
         /* simulate work */
     }
 
-    uart_puts("LOW: releasing lock\r\n");
+    uart_puts("LOW: releasing mutex\r\n");
 
-    os_sem_post(&test_lock);
+    os_mutex_unlock(&test_mutex);
+
+    uart_puts("LOW: priority restored\r\n");
 
     for (;;)
         os_delay(1000);
 }
 
 
+/* ---------------------------------------------------------
+ * MEDIUM priority task
+ * --------------------------------------------------------- */
+
 static void medium_task(void)
 {
     /*
-     * Wait until LOW has had time to acquire the lock.
+     * Wait until LOW has acquired the mutex
+     * and HIGH has had a chance to block.
      */
     os_delay(50);
 
     uart_puts("MEDIUM: running\r\n");
 
-    /*
-     * Medium priority work.
-     *
-     * This task does not need the lock.
-     * It can therefore preempt LOW while LOW
-     * is holding the lock.
-     */
     for (;;)
     {
         volatile uint32_t x = 0;
@@ -629,23 +844,30 @@ static void medium_task(void)
 }
 
 
+/* ---------------------------------------------------------
+ * HIGH priority task
+ * --------------------------------------------------------- */
+
 static void high_task(void)
 {
     /*
-     * Wait until LOW has had time to acquire the lock.
+     * LOW should already own the mutex.
      */
     os_delay(30);
 
-    uart_puts("HIGH: trying to acquire lock\r\n");
+    uart_puts("HIGH: trying to acquire mutex\r\n");
 
     /*
-     * LOW owns the lock, so HIGH blocks here.
+     * HIGH blocks here.
+     *
+     * os_mutex_lock() raises LOW's effective
+     * priority from 1 to 3.
      */
-    os_sem_wait(&test_lock);
+    os_mutex_lock(&test_mutex);
 
-    uart_puts("HIGH: acquired lock\r\n");
+    uart_puts("HIGH: acquired mutex\r\n");
 
-    os_sem_post(&test_lock);
+    os_mutex_unlock(&test_mutex);
 
     for (;;)
         os_delay(1000);
@@ -673,15 +895,15 @@ int main(void)
     uart_init();
 
     /*
-     * Binary semaphore:
-     *
-     * count = 1 means the lock is initially free.
+     * Initialize the priority-inheritance mutex.
      */
-    os_sem_init(&test_lock, 1);
+    os_mutex_init(&test_mutex);
+
 
     /*
-     * Task priorities:
+     * Priorities:
      *
+     * IDLE   = 0
      * LOW    = 1
      * MEDIUM = 2
      * HIGH   = 3
@@ -691,14 +913,17 @@ int main(void)
     create_task(medium_task, 2);
     create_task(high_task,   3);
 
+
     os_schedule();
 
     timer1_init();
 
+
     /*
      * Do NOT call sei() here.
      *
-     * The fake initial SREG already has I=1.
+     * The fake initial stack frame already contains
+     * SREG = 0x80, which enables interrupts.
      */
     start_first();
 }
