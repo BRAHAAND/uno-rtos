@@ -518,6 +518,21 @@ static int8_t create_task(void (*fn)(void), uint8_t prio)
 
 
 /* =========================================================
+ * Stack usage
+ * ========================================================= */
+
+uint8_t os_stack_free(uint8_t i)
+{
+    uint8_t n = 0;
+
+    while (n < STACK_SIZE && tasks[i].stack[n] == 0xAA)
+        n++;
+
+    return n;
+}
+
+
+/* =========================================================
  * Start first task
  * ========================================================= */
 
@@ -561,16 +576,26 @@ static void uart_print_u8(uint8_t v)
 
 
 /* =========================================================
- * Demo
+ * Tasks
  * ========================================================= */
 
-static void print_line(char c)
+static void idle_task(void)
 {
-    for (uint8_t i = 0; i < 40; i++)
-        uart_putc(c, NULL);
+    for (;;)
+    {
+    }
+}
 
-    uart_putc('\r', NULL);
-    uart_putc('\n', NULL);
+
+static void blink_task(void)
+{
+    DDRB |= _BV(PB5);
+
+    for (;;)
+    {
+        PINB = _BV(PB5);          /* toggle LED */
+        os_delay(500);
+    }
 }
 
 
@@ -604,10 +629,30 @@ static void consumer_task(void)
 }
 
 
-static void idle_task(void)
+static void print_stack(const char *name, uint8_t i)
+{
+    uart_puts(name);
+    uart_print_u8(os_stack_free(i));
+}
+
+
+static void stats_task(void)
 {
     for (;;)
     {
+        os_delay(2000);
+
+        os_sem_wait(&uart_lock);
+
+        print_stack("stack free: idle=", 0);
+        print_stack(" blink=",            1);
+        print_stack(" prod=",             2);
+        print_stack(" cons=",             3);
+        print_stack(" stats=",            4);
+
+        uart_puts("\r\n");
+
+        os_sem_post(&uart_lock);
     }
 }
 
@@ -623,18 +668,22 @@ int main(void)
     os_sem_init(&uart_lock, 1);
     os_queue_init(&q);
 
-    create_task(idle_task, 0);
-    create_task(producer_task, 1);
-    create_task(consumer_task, 1);
+    create_task(idle_task,     0);
+    create_task(blink_task,    1);
+    create_task(producer_task, 2);
+    create_task(consumer_task, 2);
+    create_task(stats_task,    1);
 
     os_schedule();
     timer1_init();
 
     /*
      * IMPORTANT:
-     * Do NOT call sei() here.
+     * No sei() here.
      *
-     * The first task's fake SREG already has I = 1.
+     * The fake frame of the first task has
+     * SREG = 0x80, which enables interrupts
+     * when the first task is restored.
      */
     start_first();
 }
