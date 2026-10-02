@@ -63,11 +63,21 @@ enum
 
 
 /* =========================================================
+ * Semaphore
+ * ========================================================= */
+
+typedef struct
+{
+    volatile uint8_t count;
+} os_sem_t;
+
+
+/* =========================================================
  * Task control block
  * ========================================================= */
 
 #define STACK_SIZE 160
-#define MAX_TASKS  3
+#define MAX_TASKS  5
 
 typedef struct
 {
@@ -75,6 +85,7 @@ typedef struct
     uint8_t state;
     uint8_t prio;
     uint16_t wake;
+    os_sem_t *wait_on;
     uint8_t stack[STACK_SIZE];
 } tcb_t;
 
@@ -216,9 +227,8 @@ void os_schedule(void)
 
 
     /*
-     * Wake up tasks whose delay has expired.
-     *
-     * The signed difference handles 16-bit tick wraparound.
+     * Wake delayed tasks and tasks waiting on
+     * an available semaphore.
      */
     for (uint8_t i = 0; i < ntasks; i++)
     {
@@ -227,12 +237,16 @@ void os_schedule(void)
         {
             tasks[i].state = T_READY;
         }
+        else if (tasks[i].state == T_WAITING &&
+                 tasks[i].wait_on->count > 0)
+        {
+            tasks[i].state = T_READY;
+        }
     }
 
 
     /*
-     * Step 1:
-     * Find the highest priority among READY tasks.
+     * Find highest priority among READY tasks.
      */
     uint8_t highest_prio = 0;
 
@@ -247,7 +261,6 @@ void os_schedule(void)
 
 
     /*
-     * Step 2:
      * Among highest-priority READY tasks,
      * choose the next task after current.
      */
@@ -283,15 +296,6 @@ void os_yield(void)
 
     RESTORE_CONTEXT();
 
-    /*
-     * IMPORTANT:
-     * This must be RETI, not RET.
-     *
-     * os_delay() disables interrupts before calling os_yield().
-     * The saved SREG therefore has I = 0.
-     *
-     * RETI restores execution and enables interrupts.
-     */
     asm volatile (
         "reti \n\t"
     );
@@ -302,6 +306,7 @@ void os_yield(void)
  * Delay
  * ========================================================= */
 
+__attribute__((noinline))
 void os_delay(uint16_t n)
 {
     cli();
@@ -311,6 +316,56 @@ void os_delay(uint16_t n)
     ((tcb_t *)current)->state = T_DELAYED;
 
     os_yield();
+}
+
+
+/* =========================================================
+ * Semaphores
+ * ========================================================= */
+
+void os_sem_init(os_sem_t *s, uint8_t initial)
+{
+    s->count = initial;
+}
+
+
+void os_sem_wait(os_sem_t *s)
+{
+    for (;;)
+    {
+        cli();
+
+        if (s->count)
+        {
+            s->count--;
+
+            sei();
+
+            return;
+        }
+
+        ((tcb_t *)current)->state = T_WAITING;
+
+        ((tcb_t *)current)->wait_on = s;
+
+        os_yield();
+
+        /*
+         * os_yield() comes back with interrupts enabled.
+         * If another task did not give us the semaphore,
+         * retry.
+         */
+    }
+}
+
+
+void os_sem_post(os_sem_t *s)
+{
+    cli();
+
+    s->count++;
+
+    sei();
 }
 
 
@@ -354,10 +409,8 @@ static int8_t create_task(void (*fn)(void), uint8_t prio)
 
     /*
      * Build the fake stack frame.
-     *
-     * The task will eventually restore this frame and RET
-     * into fn().
      */
+
     uint8_t *sp = &t->stack[STACK_SIZE - 1];
 
     uint16_t pc = (uint16_t)(uintptr_t)fn;
@@ -367,18 +420,14 @@ static int8_t create_task(void (*fn)(void), uint8_t prio)
     *sp-- = (uint8_t)(pc & 0xFF);
     *sp-- = (uint8_t)(pc >> 8);
 
-
     /* r0 */
     *sp-- = 0x00;
-
 
     /* SREG: I = 1 */
     *sp-- = 0x80;
 
-
     /* r1 */
     *sp-- = 0x00;
-
 
     /* r2 ... r31 */
     for (uint8_t r = 2; r <= 31; r++)
@@ -392,6 +441,8 @@ static int8_t create_task(void (*fn)(void), uint8_t prio)
     t->state = T_READY;
 
     t->wake = 0;
+
+    t->wait_on = NULL;
 
     return ntasks++;
 }
@@ -413,26 +464,37 @@ void start_first(void)
 
 
 /* =========================================================
- * Tasks
+ * Demo
  * ========================================================= */
+
+static void print_line(char c)
+{
+    for (uint8_t i = 0; i < 40; i++)
+        uart_putc(c, NULL);
+
+    uart_putc('\r', NULL);
+    uart_putc('\n', NULL);
+}
+
 
 static void task_a(void)
 {
     for (;;)
     {
-        uart_putc('A', NULL);
+        print_line('A');
 
-        os_delay(200);
+        os_delay(50);
     }
 }
+
 
 static void task_b(void)
 {
     for (;;)
     {
-        uart_putc('B', NULL);
+        print_line('B');
 
-        os_delay(200);
+        os_delay(50);
     }
 }
 
@@ -453,38 +515,27 @@ int main(void)
 {
     uart_init();
 
-    const char *banner = "7\r\n";
-    while (*banner) uart_putc(*banner++, NULL);
     /*
-     * Priority:
-     *
-     * idle = 0
-     * A    = 2
-     * B    = 1
+     * All three tasks have priority 1 or lower.
      */
     create_task(idle_task, 0);
 
-    create_task(task_a, 2);
+    create_task(task_a, 1);
 
     create_task(task_b, 1);
 
 
     /*
-     * Select the first task.
+     * No UART semaphore yet.
+     *
+     * This is the FIRST Step 8a flash.
      */
     os_schedule();
 
-
     timer1_init();
 
-    sei();
 
-
-    /*
-     * Never returns.
-     */
     start_first();
-
 
     while (1)
     {
