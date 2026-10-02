@@ -48,7 +48,7 @@ static void uart_puts(const char *s)
 }
 
 
-static void uart_print_u8(uint8_t v)
+static void __attribute__((unused)) uart_print_u8(uint8_t v)
 {
     char buf[3];
     uint8_t n = 0;
@@ -136,9 +136,6 @@ typedef struct
 /* =========================================================
  * Globals
  * ========================================================= */
-
-static os_sem_t   uart_lock;
-static os_queue_t q;
 
 
 /* =========================================================
