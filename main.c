@@ -95,6 +95,9 @@ typedef struct
 static os_sem_t   uart_lock;
 static os_queue_t q;
 
+/* Temporary lock for Step 11 priority-inversion test */
+static os_sem_t test_lock;
+
 
 /* =========================================================
  * Task control block
@@ -408,7 +411,7 @@ void os_queue_init(os_queue_t *q)
 
 void os_queue_put(os_queue_t *q, uint8_t v)
 {
-    os_sem_wait(&q->spaces);          /* block if full */
+    os_sem_wait(&q->spaces);
 
     cli();
 
@@ -423,7 +426,7 @@ void os_queue_put(os_queue_t *q, uint8_t v)
 
 uint8_t os_queue_get(os_queue_t *q)
 {
-    os_sem_wait(&q->items);           /* block if empty */
+    os_sem_wait(&q->items);
 
     cli();
 
@@ -558,101 +561,105 @@ static void uart_puts(const char *s)
 }
 
 
-static void uart_print_u8(uint8_t v)
+/* =========================================================
+ * Priority inversion test tasks
+ * ========================================================= */
+
+static void low_task(void)
 {
-    char buf[3];
-    uint8_t n = 0;
+    uart_puts("LOW: starting\r\n");
 
-    do
+    /*
+     * Give LOW time to start before HIGH is allowed
+     * to request the lock.
+     */
+    os_delay(20);
+
+    uart_puts("LOW: trying to acquire lock\r\n");
+
+    os_sem_wait(&test_lock);
+
+    uart_puts("LOW: acquired lock\r\n");
+
+    /*
+     * Hold the lock while doing work.
+     *
+     * HIGH will eventually try to acquire the same
+     * lock and block.
+     */
+    for (volatile uint32_t i = 0; i < 500000UL; i++)
     {
-        buf[n++] = '0' + v % 10;
-        v /= 10;
+        /* simulate work */
     }
-    while (v);
 
-    while (n)
-        uart_putc(buf[--n], NULL);
+    uart_puts("LOW: releasing lock\r\n");
+
+    os_sem_post(&test_lock);
+
+    for (;;)
+        os_delay(1000);
+}
+
+
+static void medium_task(void)
+{
+    /*
+     * Wait until LOW has had time to acquire the lock.
+     */
+    os_delay(50);
+
+    uart_puts("MEDIUM: running\r\n");
+
+    /*
+     * Medium priority work.
+     *
+     * This task does not need the lock.
+     * It can therefore preempt LOW while LOW
+     * is holding the lock.
+     */
+    for (;;)
+    {
+        volatile uint32_t x = 0;
+
+        for (uint32_t i = 0; i < 50000UL; i++)
+            x++;
+
+        os_delay(10);
+    }
+}
+
+
+static void high_task(void)
+{
+    /*
+     * Wait until LOW has had time to acquire the lock.
+     */
+    os_delay(30);
+
+    uart_puts("HIGH: trying to acquire lock\r\n");
+
+    /*
+     * LOW owns the lock, so HIGH blocks here.
+     */
+    os_sem_wait(&test_lock);
+
+    uart_puts("HIGH: acquired lock\r\n");
+
+    os_sem_post(&test_lock);
+
+    for (;;)
+        os_delay(1000);
 }
 
 
 /* =========================================================
- * Tasks
+ * Idle task
  * ========================================================= */
 
 static void idle_task(void)
 {
     for (;;)
     {
-    }
-}
-
-
-static void blink_task(void)
-{
-    DDRB |= _BV(PB5);
-
-    for (;;)
-    {
-        PINB = _BV(PB5);          /* toggle LED */
-        os_delay(500);
-    }
-}
-
-
-static void producer_task(void)
-{
-    uint8_t n = 0;
-
-    for (;;)
-    {
-        os_queue_put(&q, n++);
-
-        os_delay(250);
-    }
-}
-
-
-static void consumer_task(void)
-{
-    for (;;)
-    {
-        uint8_t v = os_queue_get(&q);
-
-        os_sem_wait(&uart_lock);
-
-        uart_puts("consumer got ");
-        uart_print_u8(v);
-        uart_puts("\r\n");
-
-        os_sem_post(&uart_lock);
-    }
-}
-
-
-static void print_stack(const char *name, uint8_t i)
-{
-    uart_puts(name);
-    uart_print_u8(os_stack_free(i));
-}
-
-
-static void stats_task(void)
-{
-    for (;;)
-    {
-        os_delay(2000);
-
-        os_sem_wait(&uart_lock);
-
-        print_stack("stack free: idle=", 0);
-        print_stack(" blink=",            1);
-        print_stack(" prod=",             2);
-        print_stack(" cons=",             3);
-        print_stack(" stats=",            4);
-
-        uart_puts("\r\n");
-
-        os_sem_post(&uart_lock);
     }
 }
 
@@ -665,25 +672,33 @@ int main(void)
 {
     uart_init();
 
-    os_sem_init(&uart_lock, 1);
-    os_queue_init(&q);
+    /*
+     * Binary semaphore:
+     *
+     * count = 1 means the lock is initially free.
+     */
+    os_sem_init(&test_lock, 1);
 
-    create_task(idle_task,     0);
-    create_task(blink_task,    1);
-    create_task(producer_task, 2);
-    create_task(consumer_task, 2);
-    create_task(stats_task,    1);
+    /*
+     * Task priorities:
+     *
+     * LOW    = 1
+     * MEDIUM = 2
+     * HIGH   = 3
+     */
+    create_task(idle_task,   0);
+    create_task(low_task,    1);
+    create_task(medium_task, 2);
+    create_task(high_task,   3);
 
     os_schedule();
+
     timer1_init();
 
     /*
-     * IMPORTANT:
-     * No sei() here.
+     * Do NOT call sei() here.
      *
-     * The fake frame of the first task has
-     * SREG = 0x80, which enables interrupts
-     * when the first task is restored.
+     * The fake initial SREG already has I=1.
      */
     start_first();
 }
