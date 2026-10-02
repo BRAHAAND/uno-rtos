@@ -6,6 +6,10 @@
 #include <string.h>
 #include <stddef.h>
 #include <avr/interrupt.h>
+static volatile uint8_t measure_start;
+static volatile uint8_t measure_result;
+static volatile uint8_t baseline;
+static volatile uint8_t measurement_done;
 
 
 /* =========================================================
@@ -573,6 +577,33 @@ static void uart_print_u8(uint8_t v)
     while (n)
         uart_putc(buf[--n], NULL);
 }
+static void uart_print_u16(uint16_t v)
+{
+    char buf[5];
+    uint8_t n = 0;
+
+    do
+    {
+        buf[n++] = '0' + v % 10;
+        v /= 10;
+    }
+    while (v);
+
+    while (n)
+        uart_putc(buf[--n], NULL);
+}
+static void timer0_measure_init(void)
+{
+    /*
+     * Timer0 normal mode, no interrupt.
+     * CPU clock / 8 = 2 MHz.
+     * Therefore each count = 0.5 us.
+     */
+    TCCR0A = 0;
+    TCCR0B = _BV(CS01);
+
+    TCNT0 = 0;
+}
 
 
 /* =========================================================
@@ -627,6 +658,87 @@ static void consumer_task(void)
         os_sem_post(&uart_lock);
     }
 }
+static void measure_task_a(void)
+{
+    /*
+     * Baseline: two back-to-back TCNT0 reads.
+     */
+    uint8_t b0 = TCNT0;
+    uint8_t b1 = TCNT0;
+
+    baseline = (uint8_t)(b1 - b0);
+
+    for (;;)
+    {
+        /*
+         * Read Timer0 immediately before yielding.
+         */
+        measure_start = TCNT0;
+
+        os_yield();
+
+        /*
+         * We get here after task B has completed the
+         * measurement and yielded back to us.
+         */
+        if (measurement_done)
+            break;
+    }
+
+    for (;;)
+    {
+    }
+}
+
+
+static void measure_task_b(void)
+{
+    /*
+     * This is the first thing B does after the context switch.
+     */
+    uint8_t end = TCNT0;
+
+    measure_result = (uint8_t)(end - measure_start);
+
+    /*
+     * Remove the baseline read overhead.
+     */
+    measure_result =
+        (uint8_t)(measure_result - baseline);
+
+    measurement_done = 1;
+
+    uart_puts("\r\n=== Step 10a ===\r\n");
+
+    uart_puts("baseline counts = ");
+    uart_print_u8(baseline);
+    uart_puts("\r\n");
+
+    uart_puts("switch counts   = ");
+    uart_print_u8(measure_result);
+    uart_puts("\r\n");
+
+    uart_puts("switch cycles   = ");
+
+    /*
+     * 1 Timer0 count = 0.5 us
+     * 1 us = 16 CPU cycles
+     *
+     * Therefore:
+     * cycles = counts * 0.5 * 16
+     *        = counts * 8
+     */
+    uart_print_u16((uint16_t)measure_result * 8);
+
+    uart_puts("\r\n");
+
+    for (;;)
+    {
+        /*
+         * Stop after the measurement.
+         */
+    }
+}
 
 
 static void print_stack(const char *name, uint8_t i)
@@ -665,25 +777,17 @@ int main(void)
 {
     uart_init();
 
-    os_sem_init(&uart_lock, 1);
-    os_queue_init(&q);
+    timer0_measure_init();
 
-    create_task(idle_task,     0);
-    create_task(blink_task,    1);
-    create_task(producer_task, 2);
-    create_task(consumer_task, 2);
-    create_task(stats_task,    1);
+    create_task(idle_task,       0);
+    create_task(measure_task_a,  1);
+    create_task(measure_task_b,  1);
 
     os_schedule();
-    timer1_init();
 
     /*
      * IMPORTANT:
      * No sei() here.
-     *
-     * The fake frame of the first task has
-     * SREG = 0x80, which enables interrupts
-     * when the first task is restored.
      */
     start_first();
 }
