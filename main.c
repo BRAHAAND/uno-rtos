@@ -1,6 +1,7 @@
 #define F_CPU 16000000UL
 
 #include <avr/io.h>
+#include <util/delay.h>
 #include <stdint.h>
 #include <string.h>
 #include <stddef.h>
@@ -18,7 +19,6 @@ static void uart_init(void)
     UCSR0B = _BV(TXEN0);
     UCSR0C = _BV(UCSZ01) | _BV(UCSZ00); // 8N1
 }
-
 
 static int uart_putc(char c, void *unused)
 {
@@ -75,10 +75,25 @@ typedef struct
 
 
 /* =========================================================
+ * Queue
+ * ========================================================= */
+
+#define QUEUE_LEN 8
+
+typedef struct
+{
+    uint8_t buf[QUEUE_LEN];
+    volatile uint8_t head, tail;
+    os_sem_t items, spaces;
+} os_queue_t;
+
+
+/* =========================================================
  * Globals
  * ========================================================= */
 
-static os_sem_t uart_lock;
+static os_sem_t   uart_lock;
+static os_queue_t q;
 
 
 /* =========================================================
@@ -208,33 +223,17 @@ volatile tcb_t *current = 0;
  * Tick counter
  * ========================================================= */
 
-static volatile uint16_t ticks = 0;
+static volatile uint16_t ticks;
 
 
 /* =========================================================
  * OS tick
  * ========================================================= */
 
-/*
- * Called from the Timer1 ISR once every 1 ms.
- */
 __attribute__((noinline, used))
 void os_tick(void)
 {
     ticks++;
-}
-
-
-/*
- * Return the current tick count.
- *
- * This is the function used by the jitter measurement
- * to determine how many 1 ms ticks elapsed.
- */
-__attribute__((noinline, used))
-uint16_t os_ticks(void)
-{
-    return ticks;
 }
 
 
@@ -395,6 +394,51 @@ void os_sem_post(os_sem_t *s)
 
 
 /* =========================================================
+ * Queue
+ * ========================================================= */
+
+void os_queue_init(os_queue_t *q)
+{
+    q->head = q->tail = 0;
+
+    os_sem_init(&q->items, 0);
+    os_sem_init(&q->spaces, QUEUE_LEN);
+}
+
+
+void os_queue_put(os_queue_t *q, uint8_t v)
+{
+    os_sem_wait(&q->spaces);          /* block if full */
+
+    cli();
+
+    q->buf[q->head] = v;
+    q->head = (q->head + 1) % QUEUE_LEN;
+
+    sei();
+
+    os_sem_post(&q->items);
+}
+
+
+uint8_t os_queue_get(os_queue_t *q)
+{
+    os_sem_wait(&q->items);           /* block if empty */
+
+    cli();
+
+    uint8_t v = q->buf[q->tail];
+    q->tail = (q->tail + 1) % QUEUE_LEN;
+
+    sei();
+
+    os_sem_post(&q->spaces);
+
+    return v;
+}
+
+
+/* =========================================================
  * Timer ISR
  * ========================================================= */
 
@@ -474,6 +518,21 @@ static int8_t create_task(void (*fn)(void), uint8_t prio)
 
 
 /* =========================================================
+ * Stack usage
+ * ========================================================= */
+
+uint8_t os_stack_free(uint8_t i)
+{
+    uint8_t n = 0;
+
+    while (n < STACK_SIZE && tasks[i].stack[n] == 0xAA)
+        n++;
+
+    return n;
+}
+
+
+/* =========================================================
  * Start first task
  * ========================================================= */
 
@@ -516,26 +575,6 @@ static void uart_print_u8(uint8_t v)
 }
 
 
-/*
- * Print a uint16_t value.
- */
-static void uart_print_u16(uint16_t v)
-{
-    char buf[5];
-    uint8_t n = 0;
-
-    do
-    {
-        buf[n++] = '0' + v % 10;
-        v /= 10;
-    }
-    while (v);
-
-    while (n)
-        uart_putc(buf[--n], NULL);
-}
-
-
 /* =========================================================
  * Tasks
  * ========================================================= */
@@ -548,133 +587,75 @@ static void idle_task(void)
 }
 
 
-/* =========================================================
- * Step 10d: Tick jitter measurement
- * ========================================================= */
-
-#define JITTER_SAMPLES 1000
-
-static volatile uint16_t jitter_min = 0xFFFF;
-static volatile uint16_t jitter_max = 0;
-
-
-/*
- * Jitter measurement task.
- *
- * Priority = 2
- */
-static void jitter_task(void)
+static void blink_task(void)
 {
-    uint16_t previous;
-    uint16_t now;
-    uint16_t delta;
+    DDRB |= _BV(PB5);
 
-    /*
-     * Let the system settle before starting.
-     */
-    os_delay(100);
-
-    /*
-     * Record starting tick.
-     */
-    previous = os_ticks();
-
-    /*
-     * Perform 1000 measurements.
-     *
-     * Each iteration requests a 10-tick delay.
-     */
-    for (uint16_t i = 0; i < JITTER_SAMPLES; i++)
-    {
-        os_delay(10);
-
-        now = os_ticks();
-
-        delta = now - previous;
-
-        previous = now;
-
-        if (delta < jitter_min)
-            jitter_min = delta;
-
-        if (delta > jitter_max)
-            jitter_max = delta;
-    }
-
-    /*
-     * Print results.
-     */
-    os_sem_wait(&uart_lock);
-
-    uart_puts("=== Tick jitter ===\r\n");
-
-    uart_puts("samples = ");
-    uart_print_u16(JITTER_SAMPLES);
-    uart_puts("\r\n");
-
-    uart_puts("min delta = ");
-    uart_print_u16(jitter_min);
-    uart_puts(" ticks\r\n");
-
-    uart_puts("max delta = ");
-    uart_print_u16(jitter_max);
-    uart_puts(" ticks\r\n");
-
-    os_sem_post(&uart_lock);
-
-    /*
-     * Measurement finished.
-     */
     for (;;)
-        os_delay(1000);
+    {
+        PINB = _BV(PB5);          /* toggle LED */
+        os_delay(500);
+    }
 }
 
 
-/*
- * Higher-priority busy task.
- *
- * Priority = 3
- *
- * It waits 200 ms, then continuously runs for
- * approximately 500 ms. During that period it has
- * higher priority than jitter_task and therefore
- * prevents jitter_task from running.
- */
-static void busy_task(void)
+static void producer_task(void)
 {
-    uint16_t end;
-
-    /*
-     * Allow jitter_task to start measuring first.
-     */
-    os_delay(200);
-
-    /*
-     * Run continuously for 500 ms.
-     *
-     * Timer1 interrupts still occur, so 'ticks'
-     * continues increasing even though this task
-     * remains the highest-priority READY task.
-     */
-    end = os_ticks() + 500;
-
-    while ((int16_t)(os_ticks() - end) < 0)
-    {
-        /*
-         * Deliberately do nothing.
-         *
-         * This is the busy loop.
-         */
-    }
-
-    /*
-     * Stop being READY so that jitter_task can run again.
-     */
-    os_delay(1000);
+    uint8_t n = 0;
 
     for (;;)
-        os_delay(1000);
+    {
+        os_queue_put(&q, n++);
+
+        os_delay(250);
+    }
 }
+
+
+static void consumer_task(void)
+{
+    for (;;)
+    {
+        uint8_t v = os_queue_get(&q);
+
+        os_sem_wait(&uart_lock);
+
+        uart_puts("consumer got ");
+        uart_print_u8(v);
+        uart_puts("\r\n");
+
+        os_sem_post(&uart_lock);
+    }
+}
+
+
+static void print_stack(const char *name, uint8_t i)
+{
+    uart_puts(name);
+    uart_print_u8(os_stack_free(i));
+}
+
+
+static void stats_task(void)
+{
+    for (;;)
+    {
+        os_delay(2000);
+
+        os_sem_wait(&uart_lock);
+
+        print_stack("stack free: idle=", 0);
+        print_stack(" blink=",            1);
+        print_stack(" prod=",             2);
+        print_stack(" cons=",             3);
+        print_stack(" stats=",            4);
+
+        uart_puts("\r\n");
+
+        os_sem_post(&uart_lock);
+    }
+}
+
 
 /* =========================================================
  * Main
@@ -685,29 +666,24 @@ int main(void)
     uart_init();
 
     os_sem_init(&uart_lock, 1);
+    os_queue_init(&q);
 
-    /*
-     * Task 0: idle
-     * Task 1: jitter measurement, priority 2
-     * Task 2: busy task, priority 3
-     */
-    create_task(idle_task,   0);
-    create_task(jitter_task, 2);
-    create_task(busy_task,   3);
+    create_task(idle_task,     0);
+    create_task(blink_task,    1);
+    create_task(producer_task, 2);
+    create_task(consumer_task, 2);
+    create_task(stats_task,    1);
 
-    /*
-     * Select first task before enabling Timer1.
-     */
     os_schedule();
-
     timer1_init();
 
     /*
-     * Do NOT call sei() here.
+     * IMPORTANT:
+     * No sei() here.
      *
-     * The fake stack frame contains SREG = 0x80,
-     * which enables interrupts when the first task
-     * starts.
+     * The fake frame of the first task has
+     * SREG = 0x80, which enables interrupts
+     * when the first task is restored.
      */
     start_first();
 }
