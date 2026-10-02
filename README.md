@@ -326,3 +326,8 @@ The commit history follows the build order, with one commit per step from the ba
 - Microchip, *AVR Instruction Set Manual*
 - avr-libc documentation
 - GCC / AVR-GCC documentation
+
+
+## License
+
+MIT (see `LICENSE`).
