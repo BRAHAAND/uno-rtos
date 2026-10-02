@@ -18,6 +18,7 @@ static void uart_init(void)
     UCSR0C = _BV(UCSZ01) | _BV(UCSZ00); // 8N1
 }
 
+
 static int uart_putc(char c, void *unused)
 {
     (void)unused;
@@ -60,19 +61,26 @@ static void timer1_init(void)
  * TCB + TASK STACKS
  * ========================================================= */
 
+enum {
+    T_FREE = 0,
+    T_READY,
+    T_DELAYED,
+    T_WAITING
+};
+
 #define STACK_SIZE 160
+#define MAX_TASKS 3
 
 typedef struct {
-    volatile uint8_t *sp;   // MUST be first member
+    volatile uint8_t *sp;      /* MUST stay first */
+    uint8_t state;
+    uint8_t prio;
     uint8_t stack[STACK_SIZE];
 } tcb_t;
 
+tcb_t tasks[MAX_TASKS];
 
-/*
- * These must be global because the assembly accesses them
- * by symbol name.
- */
-tcb_t tasks[2];
+static uint8_t ntasks;
 
 volatile tcb_t *current;
 
@@ -139,12 +147,12 @@ volatile tcb_t *current;
         "push r29               \n\t"                       \
         "push r30               \n\t"                       \
         "push r31               \n\t"                       \
-                                                            \
-        /* X = current */                                   \
+                                                        \
+        /* X = current */                              \
         "lds  r26, current     \n\t"                       \
         "lds  r27, current+1   \n\t"                       \
-                                                            \
-        /* Save SP into current->sp */                      \
+                                                        \
+        /* Save SP into current->sp */                  \
         "in   r0, __SP_L__     \n\t"                       \
         "st   X+, r0           \n\t"                       \
         "in   r0, __SP_H__     \n\t"                       \
@@ -228,39 +236,37 @@ volatile tcb_t *current;
 
 
 /* =========================================================
- * SWITCH CURRENT TASK
+ * SCHEDULER
  * ========================================================= */
 
 __attribute__((noinline, used))
-void switch_current_task(void)
+void os_schedule(void)
 {
-    if (current == &tasks[0])
-        current = &tasks[1];
-    else
-        current = &tasks[0];
+    uint8_t start =
+        current
+        ? (uint8_t)((tcb_t *)current - tasks) + 1
+        : 0;
+
+    int8_t best = -1;
+
+    for (uint8_t n = 0; n < ntasks; n++) {
+
+        uint8_t i = (start + n) % ntasks;
+
+        if (tasks[i].state == T_READY &&
+            (best < 0 || tasks[i].prio > tasks[best].prio)) {
+
+            best = i;
+        }
+    }
+
+    /* Idle task guarantees that best >= 0 */
+    current = &tasks[best];
 }
 
 
 /* =========================================================
  * TIMER1 PREEMPTION ISR
- *
- * This is the heart of Stage B.
- *
- * Timer interrupt
- *      ↓
- * SAVE_CONTEXT()
- *      ↓
- * Save current task's SP
- *      ↓
- * switch_current_task()
- *      ↓
- * current now points to other task
- *      ↓
- * RESTORE_CONTEXT()
- *      ↓
- * RETI
- *      ↓
- * other task continues
  * ========================================================= */
 
 ISR(TIMER1_COMPA_vect, ISR_NAKED)
@@ -268,7 +274,7 @@ ISR(TIMER1_COMPA_vect, ISR_NAKED)
     SAVE_CONTEXT();
 
     asm volatile (
-        "call switch_current_task \n\t"
+        "call os_schedule \n\t"
         ::: "memory"
     );
 
@@ -284,8 +290,15 @@ ISR(TIMER1_COMPA_vect, ISR_NAKED)
  * CREATE INITIAL TASK STACK
  * ========================================================= */
 
-static void create_task(tcb_t *t, void (*fn)(void))
+static int8_t create_task(void (*fn)(void), uint8_t prio)
 {
+    if (ntasks >= MAX_TASKS)
+        return -1;
+
+    tcb_t *t = &tasks[ntasks];
+
+    memset(t, 0, sizeof(tcb_t));
+
     memset(t->stack, 0xAA, STACK_SIZE);
 
     /*
@@ -347,17 +360,18 @@ static void create_task(tcb_t *t, void (*fn)(void))
      *
      *      pop r31
      */
+
     t->sp = sp;
+
+    t->prio  = prio;
+    t->state = T_READY;
+
+    return ntasks++;
 }
 
 
 /* =========================================================
  * START FIRST TASK
- *
- * There is no previous task to restore.
- *
- * We restore the fake context created by create_task()
- * and then RET into task_a().
  * ========================================================= */
 
 __attribute__((naked, noreturn))
@@ -375,7 +389,13 @@ void start_first(void)
  * TASK A
  * ========================================================= */
 
-static void task_a(void) { for (;;) { uart_putc('A', NULL); } }
+static void task_a(void)
+{
+    for (;;) {
+        uart_putc('A', NULL);
+        _delay_ms(200);
+    }
+}
 
 
 /* =========================================================
@@ -392,6 +412,17 @@ static void task_b(void)
 
 
 /* =========================================================
+ * IDLE TASK
+ * ========================================================= */
+
+static void idle_task(void)
+{
+    for (;;) {
+    }
+}
+
+
+/* =========================================================
  * MAIN
  * ========================================================= */
 
@@ -399,26 +430,19 @@ int main(void)
 {
     uart_init();
 
-    create_task(&tasks[0], task_a);
-    create_task(&tasks[1], task_b);
+    /* Idle first (index 0, priority 0), then the application tasks. */
+    create_task(idle_task, 0);
+    create_task(task_a, 1);
+    create_task(task_b, 1);
 
-    /*
-     * Start with task A.
-     */
-    current = &tasks[0];
+    /* Pick the first task to run (A). */
+    os_schedule();
 
-    /*
-     * Enable Timer1 preemption.
-     */
     timer1_init();
 
     /*
-     * Enable global interrupts.
-     */
-    sei();
-
-    /*
-     * Restore task A's fake context and jump to task_a().
+     * No sei() here: interrupts stay off until start_first() restores
+     * task A's fake SREG (I = 1). That closes the race window.
      */
     start_first();
 
