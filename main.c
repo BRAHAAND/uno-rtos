@@ -4,7 +4,9 @@
 #include <util/delay.h>
 #include <stdint.h>
 #include <string.h>
+#include <stddef.h>
 #include <avr/interrupt.h>
+
 
 /* =========================================================
  * UART
@@ -70,6 +72,28 @@ typedef struct
 {
     volatile uint8_t count;
 } os_sem_t;
+
+
+/* =========================================================
+ * Queue
+ * ========================================================= */
+
+#define QUEUE_LEN 8
+
+typedef struct
+{
+    uint8_t buf[QUEUE_LEN];
+    volatile uint8_t head, tail;
+    os_sem_t items, spaces;
+} os_queue_t;
+
+
+/* =========================================================
+ * Globals
+ * ========================================================= */
+
+static os_sem_t   uart_lock;
+static os_queue_t q;
 
 
 /* =========================================================
@@ -370,6 +394,51 @@ void os_sem_post(os_sem_t *s)
 
 
 /* =========================================================
+ * Queue
+ * ========================================================= */
+
+void os_queue_init(os_queue_t *q)
+{
+    q->head = q->tail = 0;
+
+    os_sem_init(&q->items, 0);
+    os_sem_init(&q->spaces, QUEUE_LEN);
+}
+
+
+void os_queue_put(os_queue_t *q, uint8_t v)
+{
+    os_sem_wait(&q->spaces);          /* block if full */
+
+    cli();
+
+    q->buf[q->head] = v;
+    q->head = (q->head + 1) % QUEUE_LEN;
+
+    sei();
+
+    os_sem_post(&q->items);
+}
+
+
+uint8_t os_queue_get(os_queue_t *q)
+{
+    os_sem_wait(&q->items);           /* block if empty */
+
+    cli();
+
+    uint8_t v = q->buf[q->tail];
+    q->tail = (q->tail + 1) % QUEUE_LEN;
+
+    sei();
+
+    os_sem_post(&q->spaces);
+
+    return v;
+}
+
+
+/* =========================================================
  * Timer ISR
  * ========================================================= */
 
@@ -464,6 +533,34 @@ void start_first(void)
 
 
 /* =========================================================
+ * Printing helpers
+ * ========================================================= */
+
+static void uart_puts(const char *s)
+{
+    while (*s)
+        uart_putc(*s++, NULL);
+}
+
+
+static void uart_print_u8(uint8_t v)
+{
+    char buf[3];
+    uint8_t n = 0;
+
+    do
+    {
+        buf[n++] = '0' + v % 10;
+        v /= 10;
+    }
+    while (v);
+
+    while (n)
+        uart_putc(buf[--n], NULL);
+}
+
+
+/* =========================================================
  * Demo
  * ========================================================= */
 
@@ -477,24 +574,32 @@ static void print_line(char c)
 }
 
 
-static void task_a(void)
+static void producer_task(void)
 {
+    uint8_t n = 0;
+
     for (;;)
     {
-        print_line('A');
+        os_queue_put(&q, n++);
 
-        os_delay(50);
+        os_delay(250);
     }
 }
 
 
-static void task_b(void)
+static void consumer_task(void)
 {
     for (;;)
     {
-        print_line('B');
+        uint8_t v = os_queue_get(&q);
 
-        os_delay(50);
+        os_sem_wait(&uart_lock);
+
+        uart_puts("consumer got ");
+        uart_print_u8(v);
+        uart_puts("\r\n");
+
+        os_sem_post(&uart_lock);
     }
 }
 
@@ -515,29 +620,21 @@ int main(void)
 {
     uart_init();
 
-    /*
-     * All three tasks have priority 1 or lower.
-     */
+    os_sem_init(&uart_lock, 1);
+    os_queue_init(&q);
+
     create_task(idle_task, 0);
+    create_task(producer_task, 1);
+    create_task(consumer_task, 1);
 
-    create_task(task_a, 1);
-
-    create_task(task_b, 1);
-
-
-    /*
-     * No UART semaphore yet.
-     *
-     * This is the FIRST Step 8a flash.
-     */
     os_schedule();
-
     timer1_init();
 
-
+    /*
+     * IMPORTANT:
+     * Do NOT call sei() here.
+     *
+     * The first task's fake SREG already has I = 1.
+     */
     start_first();
-
-    while (1)
-    {
-    }
 }
